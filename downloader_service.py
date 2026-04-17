@@ -21,7 +21,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from botocore.exceptions import BotoCoreError, ClientError
+from dotenv import load_dotenv
 
+
+load_dotenv()
 
 APP_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = APP_DIR / "videos.db"

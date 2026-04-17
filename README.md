@@ -18,16 +18,22 @@ Dependency sistem:
 - `ffmpeg`
 - `ffprobe`
 
-Env penting:
+Konfigurasi pakai `.env`:
 
 ```bash
-export S3_ENDPOINT_URL="http://minio.internal:9000"
-export S3_ACCESS_KEY_ID="minio_access_key"
-export S3_SECRET_ACCESS_KEY="minio_secret_key"
-export S3_BUCKET_NAME="videos"
-export S3_PUBLIC_BASE_URL="http://minio.internal:9000"
-export NVENC_PRESET="p1"
-export NVENC_CQ="25"
+cp .env.example .env
+```
+
+Isi `.env`:
+
+```env
+S3_ENDPOINT_URL=http://minio.internal:9000
+S3_ACCESS_KEY_ID=minio_access_key
+S3_SECRET_ACCESS_KEY=minio_secret_key
+S3_BUCKET_NAME=videos
+S3_PUBLIC_BASE_URL=http://minio.internal:9000
+NVENC_PRESET=p1
+NVENC_CQ=25
 ```
 
 Jalankan:
