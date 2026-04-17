@@ -140,16 +140,22 @@ def run_command_with_output(command: list[str], cwd: Path) -> str:
 
 
 def get_media_duration_seconds(input_path: Path, workspace: Path) -> float:
+    log_info("probing duration", file=input_path.name)
     stdout = run_command_with_output(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(input_path)], cwd=workspace)
-    return float(stdout.strip())
+    duration = float(stdout.strip())
+    log_info("duration probed", file=input_path.name, duration_seconds=str(duration))
+    return duration
 
 
 def get_media_height(input_path: Path, workspace: Path) -> int:
+    log_info("probing height", file=input_path.name)
     stdout = run_command_with_output(
         ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "default=noprint_wrappers=1:nokey=1", str(input_path)],
         cwd=workspace,
     )
-    return int(stdout.strip())
+    height = int(stdout.strip())
+    log_info("height probed", file=input_path.name, height=str(height))
+    return height
 
 
 def calculate_video_bitrate_kbps(duration_seconds: float, resolution: str) -> int:
@@ -197,21 +203,27 @@ def build_ffmpeg_command(input_path: Path, output_path: Path, height: int, video
 
 def compress_video(input_path: Path, resolution: str, height: int, workspace: Path) -> Path:
     output_path = workspace / f"{input_path.stem}_{resolution}.mp4"
+    log_info("compression started", file=input_path.name, resolution=resolution, height=str(height))
     duration = get_media_duration_seconds(input_path, workspace)
     video_bitrate_kbps = calculate_video_bitrate_kbps(duration, resolution)
     audio_bitrate_kbps = TARGET_AUDIO_BITRATES_KBPS[resolution]
     run_command(build_ffmpeg_command(input_path, output_path, height, video_bitrate_kbps, audio_bitrate_kbps), cwd=workspace)
+    log_info("compression pass finished", output=output_path.name, resolution=resolution, size_bytes=str(output_path.stat().st_size))
     if output_path.stat().st_size > TARGET_SIZE_LIMITS_BYTES[resolution]:
+        log_info("compression retry needed", output=output_path.name, resolution=resolution, size_bytes=str(output_path.stat().st_size))
         output_path.unlink(missing_ok=True)
         reduced = max(int(video_bitrate_kbps * 0.7), MIN_VIDEO_BITRATE_KBPS)
         run_command(build_ffmpeg_command(input_path, output_path, height, reduced, audio_bitrate_kbps), cwd=workspace)
+        log_info("compression retry finished", output=output_path.name, resolution=resolution, size_bytes=str(output_path.stat().st_size))
     if output_path.stat().st_size > TARGET_SIZE_LIMITS_BYTES[resolution]:
         raise HTTPException(status_code=400, detail=f"Hasil kompresi untuk {resolution} melebihi target ukuran")
+    log_info("compression finished", output=output_path.name, resolution=resolution, size_bytes=str(output_path.stat().st_size))
     return output_path
 
 
 def save_variant(job_id: str, title: str | None, episode: str, resolution: str, link: str) -> dict:
     record_id = str(uuid.uuid4())
+    log_info("saving variant", job_id=job_id, episode=episode, resolution=resolution, link=link)
     with closing(get_connection()) as connection:
         connection.execute(
             "INSERT INTO video_uploads (id, job_id, title, episode, resolution, link) VALUES (?, ?, ?, ?, ?, ?)",
@@ -222,8 +234,10 @@ def save_variant(job_id: str, title: str | None, episode: str, resolution: str, 
 
 
 def upload_to_catbox(file_path: Path, workspace: Path) -> str:
+    log_info("catbox upload started", file=file_path.name, size_bytes=str(file_path.stat().st_size))
     last_error: HTTPException | None = None
     for attempt in range(1, CATBOX_UPLOAD_MAX_ATTEMPTS + 1):
+        log_info("catbox upload attempt", file=file_path.name, attempt=str(attempt), max_attempts=str(CATBOX_UPLOAD_MAX_ATTEMPTS))
         command = [
             "curl",
             "--location",
@@ -252,10 +266,12 @@ def upload_to_catbox(file_path: Path, workspace: Path) -> str:
         try:
             stdout = run_command_with_output(command, cwd=workspace).strip()
             if stdout.startswith("http"):
+                log_info("catbox upload finished", file=file_path.name, link=stdout, attempt=str(attempt))
                 return stdout
             raise HTTPException(status_code=502, detail={"message": "Catbox upload failed", "response": stdout[:1000]})
         except HTTPException as exc:
             last_error = exc if exc.status_code == 502 else HTTPException(status_code=502, detail=exc.detail)
+            log_info("catbox upload attempt failed", file=file_path.name, attempt=str(attempt), detail=str(exc.detail))
             if attempt < CATBOX_UPLOAD_MAX_ATTEMPTS:
                 time.sleep(CATBOX_UPLOAD_RETRY_DELAY_SECONDS)
     assert last_error is not None
@@ -277,18 +293,23 @@ async def transcode_upload(
     workspace = WORKDIR_ROOT / f"{job_id}_{uuid.uuid4().hex[:8]}"
     workspace.mkdir(parents=True, exist_ok=True)
     source_path = workspace / (file.filename or f"{uuid.uuid4()}.mp4")
+    log_info("transcode request received", job_id=job_id, episode=episode, filename=file.filename or "", workspace=str(workspace))
     try:
         with source_path.open("wb") as handle:
+            total_bytes = 0
             while True:
                 chunk = await file.read(1024 * 1024)
                 if not chunk:
                     break
                 handle.write(chunk)
+                total_bytes += len(chunk)
+            log_info("source file stored", job_id=job_id, file=source_path.name, size_bytes=str(total_bytes))
 
         source_height = get_media_height(source_path, workspace)
         variants: list[VideoVariantResponse] = []
         for resolution, height in TARGET_RESOLUTIONS.items():
             if height > source_height:
+                log_info("resolution skipped", job_id=job_id, file=source_path.name, resolution=resolution, source_height=str(source_height))
                 continue
             compressed = compress_video(source_path, resolution, height, workspace)
             try:
@@ -296,14 +317,17 @@ async def transcode_upload(
                 variants.append(VideoVariantResponse(**save_variant(job_id, title or None, episode, resolution, link)))
             finally:
                 compressed.unlink(missing_ok=True)
+                log_info("compressed file removed", file=compressed.name)
 
         if not variants:
             raise HTTPException(status_code=400, detail="Tidak ada resolusi target yang cocok dengan tinggi video sumber")
+        log_info("transcode request finished", job_id=job_id, episode=episode, variant_count=str(len(variants)))
         return TranscodeResponse(job_id=job_id, title=title or None, episode=episode, variants=variants)
     finally:
         await file.close()
         source_path.unlink(missing_ok=True)
         shutil.rmtree(workspace, ignore_errors=True)
+        log_info("transcode workspace removed", job_id=job_id, workspace=str(workspace))
 
 
 if __name__ == "__main__":

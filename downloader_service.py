@@ -15,13 +15,15 @@ import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
+from requests.exceptions import RequestException, SSLError
 
 
 APP_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = APP_DIR / "videos.db"
 WORKDIR_ROOT = APP_DIR / "workdir"
 DEFAULT_SOURCE_URL = "https://www.bilibili.tv/id/play/2343020"
-TRANSCODER_API_URL = os.getenv("TRANSCODER_API_URL", "http://127.0.0.1:9000/transcode/upload").strip()
+TRANSCODER_API_URL = os.getenv("TRANSCODER_API_URL", "http://10.253.128.163:9080/transcode/upload").strip()
+TRANSCODER_API_VERIFY_SSL = os.getenv("TRANSCODER_API_VERIFY_SSL", "1") != "0"
 DEV_MODE = False
 LOGGER = logging.getLogger("video_downloader")
 
@@ -161,12 +163,14 @@ def download_videos(source_url: str, workspace: Path) -> list[Path]:
 
 
 def create_job(job_id: str) -> None:
+    log_info("job created", job_id=job_id)
     with closing(get_connection()) as connection:
         connection.execute("INSERT INTO video_jobs (job_id, status, title, episode, error) VALUES (?, 'processing', '', '', '')", (job_id,))
         connection.commit()
 
 
 def update_job(job_id: str, status: str, title: str | None = None, episode: str | None = None, error: str | None = None) -> None:
+    log_info("job updated", job_id=job_id, status=status, title=title or "", episode=episode or "", error=error or "")
     with closing(get_connection()) as connection:
         connection.execute(
             """
@@ -180,6 +184,7 @@ def update_job(job_id: str, status: str, title: str | None = None, episode: str 
 
 
 def save_variant(job_id: str, title: str | None, episode: str, resolution: str, link: str) -> None:
+    log_info("saving variant", job_id=job_id, episode=episode, resolution=resolution, link=link)
     with closing(get_connection()) as connection:
         connection.execute(
             "INSERT INTO video_uploads (id, job_id, title, episode, resolution, link) VALUES (?, ?, ?, ?, ?, ?)",
@@ -189,12 +194,14 @@ def save_variant(job_id: str, title: str | None, episode: str, resolution: str, 
 
 
 def delete_variants(job_id: str) -> None:
+    log_info("deleting variants", job_id=job_id)
     with closing(get_connection()) as connection:
         connection.execute("DELETE FROM video_uploads WHERE job_id = ?", (job_id,))
         connection.commit()
 
 
 def build_job_response(job_id: str) -> VideoJobResponse:
+    log_info("building job response", job_id=job_id)
     with closing(get_connection()) as connection:
         job = connection.execute("SELECT job_id, status, title, episode, error FROM video_jobs WHERE job_id = ?", (job_id,)).fetchone()
         rows = connection.execute(
@@ -222,14 +229,37 @@ def build_job_response(job_id: str) -> VideoJobResponse:
 
 
 def submit_to_transcoder(job_id: str, file_path: Path, title: str | None, episode: str) -> list[dict]:
-    log_info("remote transcode started", job_id=job_id, file=file_path.name, episode=episode)
+    file_size = str(file_path.stat().st_size)
+    log_info("remote transcode started", job_id=job_id, file=file_path.name, episode=episode, file_size=file_size, url=TRANSCODER_API_URL)
     with file_path.open("rb") as handle:
-        response = requests.post(
-            TRANSCODER_API_URL,
-            data={"job_id": job_id, "title": title or "", "episode": episode},
-            files={"file": (file_path.name, handle, "application/octet-stream")},
-            timeout=7200,
-        )
+        try:
+            response = requests.post(
+                TRANSCODER_API_URL,
+                data={"job_id": job_id, "title": title or "", "episode": episode},
+                files={"file": (file_path.name, handle, "application/octet-stream")},
+                timeout=7200,
+                verify=TRANSCODER_API_VERIFY_SSL,
+            )
+        except SSLError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "SSL handshake to transcoder API failed",
+                    "url": TRANSCODER_API_URL,
+                    "hint": "Check the HTTPS reverse proxy/certificate on the transcoder host, or temporarily set TRANSCODER_API_VERIFY_SSL=0.",
+                    "error": str(exc),
+                },
+            ) from exc
+        except RequestException as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "Transcoder API request failed",
+                    "url": TRANSCODER_API_URL,
+                    "error": str(exc),
+                },
+            ) from exc
+    log_info("remote transcode responded", job_id=job_id, file=file_path.name, status_code=str(response.status_code))
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail={"message": f"Transcoder API failed with status {response.status_code}", "response": response.text[:2000]})
     payload = response.json()
@@ -254,19 +284,23 @@ def process_video(payload: ProcessVideoRequest) -> VideoJobResponse:
     single_episode: str | None = None
 
     try:
+        log_info("pipeline started", job_id=job_id, source_url=payload.source_url, title=payload.title or "")
         files = download_videos(payload.source_url, workspace)
         update_job(job_id, "processing", title=payload.title or "", episode="")
 
         for index, file_path in enumerate(files):
             episode = resolve_episode(file_path)
+            log_info("episode processing", job_id=job_id, file=file_path.name, episode=episode)
             if len(files) == 1 and index == 0:
                 single_episode = episode
             variants = submit_to_transcoder(job_id, file_path, payload.title, episode)
             for variant in variants:
                 save_variant(job_id, variant.get("title"), variant["episode"], variant["resolution"], variant["link"])
             file_path.unlink(missing_ok=True)
+            log_info("source file removed", job_id=job_id, file=file_path.name)
 
         update_job(job_id, "success", title=payload.title or "", episode=single_episode or "", error="")
+        log_info("pipeline finished", job_id=job_id, status="success")
     except Exception as exc:
         delete_variants(job_id)
         update_job(job_id, "failed", error=str(exc))

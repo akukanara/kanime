@@ -18,6 +18,13 @@ Env penting:
 
 ```bash
 export TRANSCODER_API_URL="http://ip-server-gpu:9000/transcode/upload"
+export TRANSCODER_API_VERIFY_SSL="1"
+```
+
+Jika reverse proxy HTTPS di server transcoder masih bermasalah atau self-signed, sementara bisa pakai:
+
+```bash
+export TRANSCODER_API_VERIFY_SSL="0"
 ```
 
 Jalankan:
