@@ -50,6 +50,7 @@ DEV_MODE = False
 LOGGER = logging.getLogger("video_downloader")
 JOB_LOGS: dict[str, list[str]] = {}
 JOB_LOGS_LOCK = threading.Lock()
+PROCESS_LOCK = threading.Lock()
 S3_CLIENT = None
 
 
@@ -196,9 +197,12 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(title="Downloader API", lifespan=lifespan)
 
 
-def run_command(command: list[str], cwd: Path) -> None:
+def run_command(command: list[str], cwd: Path, job_id: str | None = None) -> None:
     if DEV_MODE:
-        log_info("running command", cwd=str(cwd), command=" ".join(command))
+        context = {"cwd": str(cwd), "command": " ".join(command)}
+        if job_id:
+            context["job_id"] = job_id
+        log_info("running command", **context)
         process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         output_lines: list[str] = []
         assert process.stdout is not None
@@ -216,7 +220,9 @@ def run_command(command: list[str], cwd: Path) -> None:
         raise HTTPException(status_code=500, detail={"message": f"Command failed: {' '.join(command)}", "stdout": exc.stdout[-4000:], "stderr": exc.stderr[-4000:]}) from exc
 
 
-def run_command_with_output(command: list[str], cwd: Path) -> str:
+def run_command_with_output(command: list[str], cwd: Path, job_id: str | None = None) -> str:
+    if job_id:
+        log_info("running command with output", job_id=job_id, cwd=str(cwd), command=" ".join(command))
     try:
         result = subprocess.run(command, cwd=cwd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
@@ -239,19 +245,19 @@ def resolve_episode(file_path: Path) -> str:
     return episode
 
 
-def download_videos(source_url: str, workspace: Path, cookies_text: str | None = None) -> list[Path]:
-    log_info("download started", source_url=source_url, workspace=str(workspace))
+def download_videos(source_url: str, workspace: Path, job_id: str, cookies_text: str | None = None) -> list[Path]:
+    log_info("download started", job_id=job_id, source_url=source_url, workspace=str(workspace))
     if cookies_text and cookies_text.strip():
         cookies_path = workspace / "cookies.txt"
         cookies_path.write_text(cookies_text, encoding="utf-8")
         command = ["yt-dlp", "--cookies", str(cookies_path), source_url]
     else:
         command = ["yt-dlp", "--cookies-from-browser", "chrome", source_url]
-    run_command(command, cwd=workspace)
+    run_command(command, cwd=workspace, job_id=job_id)
     files = sorted((path for path in workspace.iterdir() if is_video_file(path)), key=lambda item: item.name)
     if not files:
         raise HTTPException(status_code=500, detail="Downloaded video file was not found")
-    log_info("download finished", file_count=str(len(files)))
+    log_info("download finished", job_id=job_id, file_count=str(len(files)))
     return files
 
 
@@ -329,9 +335,45 @@ def list_jobs() -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def has_processing_job() -> bool:
+    with closing(get_connection()) as connection:
+        row = connection.execute("SELECT job_id FROM video_jobs WHERE status = 'processing' LIMIT 1").fetchone()
+    return row is not None
+
+
+def run_pipeline_job(job_id: str, payload: ProcessVideoRequest, workspace: Path) -> None:
+    single_episode: str | None = None
+    try:
+        log_info("pipeline started", job_id=job_id, source_url=payload.source_url, title=payload.title or "")
+        files = download_videos(payload.source_url, workspace, job_id, payload.cookies_text)
+        update_job(job_id, "processing", title=payload.title or "", episode="")
+
+        for index, file_path in enumerate(files):
+            episode = resolve_episode(file_path)
+            log_info("episode processing", job_id=job_id, file=file_path.name, episode=episode)
+            if len(files) == 1 and index == 0:
+                single_episode = episode
+            variants = transcode_and_store(job_id, file_path, payload.title, episode, workspace)
+            for variant in variants:
+                save_variant(job_id, variant.get("title"), variant["episode"], variant["resolution"], variant["link"])
+            file_path.unlink(missing_ok=True)
+            log_info("source file removed", job_id=job_id, file=file_path.name)
+
+        update_job(job_id, "success", title=payload.title or "", episode=single_episode or "", error="")
+        log_info("pipeline finished", job_id=job_id, status="success")
+    except Exception as exc:
+        delete_variants(job_id)
+        update_job(job_id, "failed", error=str(exc))
+        LOGGER.exception("pipeline failed | job_id=%s", job_id)
+        log_info("pipeline failed", job_id=job_id, error=str(exc))
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+        log_info("workspace removed", job_id=job_id, workspace=str(workspace))
+
+
 def get_media_duration_seconds(input_path: Path, workspace: Path, job_id: str) -> float:
     log_info("probing duration", job_id=job_id, file=input_path.name)
-    stdout = run_command_with_output(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(input_path)], cwd=workspace)
+    stdout = run_command_with_output(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(input_path)], cwd=workspace, job_id=job_id)
     duration = float(stdout.strip())
     log_info("duration probed", job_id=job_id, file=input_path.name, duration_seconds=str(duration))
     return duration
@@ -342,6 +384,7 @@ def get_media_height(input_path: Path, workspace: Path, job_id: str) -> int:
     stdout = run_command_with_output(
         ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "default=noprint_wrappers=1:nokey=1", str(input_path)],
         cwd=workspace,
+        job_id=job_id,
     )
     height = int(stdout.strip())
     log_info("height probed", job_id=job_id, file=input_path.name, height=str(height))
@@ -402,13 +445,13 @@ def compress_video(input_path: Path, resolution: str, height: int, workspace: Pa
     duration = get_media_duration_seconds(input_path, workspace, job_id)
     video_bitrate_kbps = calculate_video_bitrate_kbps(duration, resolution)
     audio_bitrate_kbps = TARGET_AUDIO_BITRATES_KBPS[resolution]
-    run_command(build_ffmpeg_command(input_path, output_path, height, video_bitrate_kbps, audio_bitrate_kbps), cwd=workspace)
+    run_command(build_ffmpeg_command(input_path, output_path, height, video_bitrate_kbps, audio_bitrate_kbps), cwd=workspace, job_id=job_id)
     log_info("compression pass finished", job_id=job_id, output=output_path.name, resolution=resolution, size_bytes=str(output_path.stat().st_size))
     if output_path.stat().st_size > TARGET_SIZE_LIMITS_BYTES[resolution]:
         log_info("compression retry needed", job_id=job_id, output=output_path.name, resolution=resolution, size_bytes=str(output_path.stat().st_size))
         output_path.unlink(missing_ok=True)
         reduced = max(int(video_bitrate_kbps * 0.7), MIN_VIDEO_BITRATE_KBPS)
-        run_command(build_ffmpeg_command(input_path, output_path, height, reduced, audio_bitrate_kbps), cwd=workspace)
+        run_command(build_ffmpeg_command(input_path, output_path, height, reduced, audio_bitrate_kbps), cwd=workspace, job_id=job_id)
         log_info("compression retry finished", job_id=job_id, output=output_path.name, resolution=resolution, size_bytes=str(output_path.stat().st_size))
     if output_path.stat().st_size > TARGET_SIZE_LIMITS_BYTES[resolution]:
         raise HTTPException(status_code=400, detail=f"Hasil kompresi untuk {resolution} melebihi target ukuran")
@@ -473,53 +516,458 @@ def index() -> str:
   <meta charset="utf-8">
   <title>Video Pipeline</title>
   <style>
-    body {{ font-family: sans-serif; margin: 24px; background: #f4f1ea; color: #1f1c18; }}
-    .grid {{ display: grid; grid-template-columns: 420px 1fr; gap: 24px; }}
-    textarea, input {{ width: 100%; box-sizing: border-box; padding: 10px; margin-top: 6px; margin-bottom: 12px; }}
-    textarea {{ min-height: 180px; }}
-    button {{ padding: 10px 14px; border: 0; background: #0f766e; color: white; cursor: pointer; }}
-    pre {{ background: #111827; color: #e5e7eb; padding: 12px; min-height: 360px; overflow: auto; white-space: pre-wrap; }}
-    .card {{ background: white; padding: 16px; border-radius: 10px; box-shadow: 0 4px 16px rgba(0,0,0,0.08); }}
-    ul {{ padding-left: 18px; }}
-    li {{ cursor: pointer; margin-bottom: 8px; }}
+    :root {{
+      --bg: #efe8dd;
+      --paper: #fffaf2;
+      --panel: #fffdf8;
+      --line: #d9cdbd;
+      --text: #241c15;
+      --muted: #6c5f53;
+      --accent: #14532d;
+      --accent-2: #c2410c;
+      --log-bg: #14181f;
+      --log-text: #e7edf6;
+      --success: #166534;
+      --failed: #b91c1c;
+      --processing: #b45309;
+      --shadow: 0 18px 44px rgba(55, 35, 12, 0.12);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(194, 65, 12, 0.16), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(20, 83, 45, 0.18), transparent 24%),
+        linear-gradient(135deg, #f7f0e5 0%, var(--bg) 55%, #e7dece 100%);
+      padding: 28px;
+    }}
+    .shell {{
+      max-width: 1460px;
+      margin: 0 auto;
+      display: grid;
+      gap: 18px;
+    }}
+    .hero {{
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 18px;
+      background: rgba(255, 250, 242, 0.72);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(217, 205, 189, 0.8);
+      border-radius: 26px;
+      padding: 24px 26px;
+      box-shadow: var(--shadow);
+    }}
+    .hero h1 {{
+      margin: 0;
+      font-size: 34px;
+      line-height: 1;
+      letter-spacing: -0.04em;
+    }}
+    .hero p {{
+      margin: 10px 0 0;
+      color: var(--muted);
+      max-width: 720px;
+    }}
+    .badge {{
+      border-radius: 999px;
+      padding: 10px 14px;
+      background: rgba(20, 83, 45, 0.1);
+      color: var(--accent);
+      font-weight: 700;
+      white-space: nowrap;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: 420px minmax(0, 1fr);
+      gap: 18px;
+      align-items: start;
+    }}
+    .stack {{
+      display: grid;
+      gap: 18px;
+    }}
+    .card {{
+      background: rgba(255, 253, 248, 0.92);
+      border: 1px solid rgba(217, 205, 189, 0.92);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }}
+    .card-head {{
+      padding: 16px 18px 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }}
+    .card-body {{
+      padding: 18px;
+    }}
+    .title {{
+      margin: 0;
+      font-size: 18px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }}
+    .muted {{
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    label {{
+      display: block;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--muted);
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }}
+    input, textarea {{
+      width: 100%;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.84);
+      border-radius: 14px;
+      padding: 13px 14px;
+      font: inherit;
+      color: var(--text);
+      transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+    }}
+    input:focus, textarea:focus {{
+      outline: none;
+      border-color: rgba(20, 83, 45, 0.7);
+      box-shadow: 0 0 0 4px rgba(20, 83, 45, 0.08);
+      transform: translateY(-1px);
+    }}
+    textarea {{
+      min-height: 200px;
+      resize: vertical;
+    }}
+    .actions {{
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      margin-top: 16px;
+    }}
+    button {{
+      border: 0;
+      border-radius: 999px;
+      padding: 14px 20px;
+      background: linear-gradient(135deg, #14532d 0%, #1f7a45 100%);
+      color: white;
+      font: inherit;
+      font-weight: 800;
+      cursor: pointer;
+      box-shadow: 0 14px 30px rgba(20, 83, 45, 0.22);
+      transition: transform 0.2s ease, opacity 0.2s ease, box-shadow 0.2s ease;
+    }}
+    button:hover {{ transform: translateY(-1px); }}
+    button:disabled {{
+      cursor: not-allowed;
+      opacity: 0.5;
+      box-shadow: none;
+      transform: none;
+    }}
+    .secondary {{
+      background: transparent;
+      color: var(--accent-2);
+      box-shadow: none;
+      border: 1px solid rgba(194, 65, 12, 0.3);
+    }}
+    .stats {{
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+    }}
+    .stat {{
+      background: rgba(255, 255, 255, 0.7);
+      border: 1px solid rgba(217, 205, 189, 0.84);
+      border-radius: 18px;
+      padding: 14px;
+    }}
+    .stat strong {{
+      display: block;
+      font-size: 28px;
+      letter-spacing: -0.04em;
+    }}
+    .job-list {{
+      display: grid;
+      gap: 12px;
+      max-height: 480px;
+      overflow: auto;
+      padding-right: 4px;
+    }}
+    .job-item {{
+      border: 1px solid rgba(217, 205, 189, 0.9);
+      background: rgba(255, 255, 255, 0.78);
+      border-radius: 18px;
+      padding: 14px;
+      cursor: pointer;
+      transition: transform 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+    }}
+    .job-item:hover {{
+      transform: translateY(-1px);
+      border-color: rgba(20, 83, 45, 0.38);
+    }}
+    .job-item.active {{
+      border-color: rgba(20, 83, 45, 0.55);
+      background: rgba(20, 83, 45, 0.08);
+    }}
+    .job-top {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 8px;
+    }}
+    .job-id {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+    .status {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      background: rgba(108, 95, 83, 0.12);
+      color: var(--muted);
+    }}
+    .status.processing {{ color: var(--processing); background: rgba(180, 83, 9, 0.12); }}
+    .status.success {{ color: var(--success); background: rgba(22, 101, 52, 0.12); }}
+    .status.failed {{ color: var(--failed); background: rgba(185, 28, 28, 0.12); }}
+    .job-title {{
+      font-weight: 800;
+      margin-bottom: 6px;
+    }}
+    .detail-grid {{
+      display: grid;
+      grid-template-columns: 1.35fr 0.95fr;
+      gap: 18px;
+    }}
+    .viewer-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 12px;
+    }}
+    .viewer-title {{
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: -0.03em;
+    }}
+    .viewer-sub {{
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 4px;
+    }}
+    .log-box, .json-box {{
+      border-radius: 18px;
+      overflow: auto;
+      min-height: 520px;
+      max-height: 520px;
+    }}
+    .log-box {{
+      background: linear-gradient(180deg, #151922 0%, #0f131a 100%);
+      color: var(--log-text);
+      padding: 16px;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }}
+    .json-box {{
+      background: rgba(255, 255, 255, 0.78);
+      border: 1px solid rgba(217, 205, 189, 0.86);
+      padding: 16px;
+      white-space: pre-wrap;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }}
+    .empty {{
+      padding: 28px;
+      border: 1px dashed rgba(217, 205, 189, 0.9);
+      border-radius: 18px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.52);
+      text-align: center;
+    }}
+    @media (max-width: 1100px) {{
+      .grid, .detail-grid {{ grid-template-columns: 1fr; }}
+      .stats {{ grid-template-columns: 1fr; }}
+    }}
   </style>
 </head>
 <body>
-  <h1>Video Pipeline</h1>
-  <div class="grid">
-    <div class="card">
-      <label>Source URL</label>
-      <input id="source_url" value="{html.escape(DEFAULT_SOURCE_URL)}" />
-      <label>Title</label>
-      <input id="title" placeholder="Optional title override" />
-      <label>Cookies Text</label>
-      <textarea id="cookies_text" placeholder="Paste Netscape cookies text here. Leave empty to use --cookies-from-browser chrome."></textarea>
-      <button onclick="startJob()">Start Job</button>
-      <h3>Jobs</h3>
-      <ul id="jobs"></ul>
-    </div>
-    <div class="card">
-      <h3 id="job_title">No job selected</h3>
-      <pre id="logs"></pre>
-      <pre id="details"></pre>
+  <div class="shell">
+    <section class="hero">
+      <div>
+        <h1>Kanime Pipeline Console</h1>
+        <p>Paste URL dan cookies, lalu job langsung jalan. Log akan langsung nempel ke job terbaru tanpa perlu pilih manual, sementara daftar job tetap bisa dipakai buat buka hasil lama.</p>
+      </div>
+      <div class="badge" id="hero_badge">Idle</div>
+    </section>
+
+    <div class="grid">
+      <div class="stack">
+        <section class="card">
+          <div class="card-head">
+            <div>
+              <h2 class="title">New Job</h2>
+              <div class="muted">Downloader, NVENC transcode, lalu upload ke storage internal.</div>
+            </div>
+          </div>
+          <div class="card-body">
+            <label for="source_url">Source URL</label>
+            <input id="source_url" value="{html.escape(DEFAULT_SOURCE_URL)}" />
+            <label for="title">Title Override</label>
+            <input id="title" placeholder="Opsional. Episode tetap diparse dari nama file." />
+            <label for="cookies_text">Cookies Text</label>
+            <textarea id="cookies_text" placeholder="Paste Netscape cookies text di sini. Kalau kosong, service akan fallback ke --cookies-from-browser chrome."></textarea>
+            <div class="actions">
+              <button id="start_button" onclick="startJob()">Start Pipeline</button>
+              <button class="secondary" onclick="clearCookies()">Clear Cookies</button>
+            </div>
+            <div class="muted" id="form_status" style="margin-top: 12px;">Siap menerima job baru.</div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <div>
+              <h2 class="title">Overview</h2>
+              <div class="muted">Ringkasan job terakhir yang tercatat di database.</div>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="stats">
+              <div class="stat"><strong id="stat_total">0</strong><span class="muted">Total Jobs</span></div>
+              <div class="stat"><strong id="stat_processing">0</strong><span class="muted">Processing</span></div>
+              <div class="stat"><strong id="stat_success">0</strong><span class="muted">Success</span></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <div>
+              <h2 class="title">Job List</h2>
+              <div class="muted">Klik job untuk buka detail lama. Job baru otomatis terbuka.</div>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="job-list" id="jobs"></div>
+          </div>
+        </section>
+      </div>
+
+      <section class="card">
+        <div class="card-body">
+          <div class="viewer-head">
+            <div>
+              <h2 class="viewer-title" id="job_title">Belum ada job dipilih</h2>
+              <div class="viewer-sub" id="job_subtitle">Klik Start Pipeline untuk mulai dan log akan langsung tampil di sini.</div>
+            </div>
+            <div id="current_status" class="status">idle</div>
+          </div>
+          <div class="detail-grid">
+            <div>
+              <div class="muted" style="margin-bottom: 8px;">Live Logs</div>
+              <div id="logs" class="log-box">Menunggu job...</div>
+            </div>
+            <div>
+              <div class="muted" style="margin-bottom: 8px;">Job Details</div>
+              <div id="details" class="json-box">Belum ada data.</div>
+            </div>
+          </div>
+        </div>
+      </section>
     </div>
   </div>
   <script>
     let currentJobId = null;
     let eventSource = null;
+    let detailRefreshHandle = null;
+
+    function escapeHtml(value) {{
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+    }}
+
+    function setFormState(isBusy, message) {{
+      document.getElementById('start_button').disabled = isBusy;
+      document.getElementById('form_status').textContent = message;
+    }}
+
+    function setCurrentStatus(status) {{
+      const node = document.getElementById('current_status');
+      node.className = `status ${{status || ''}}`;
+      node.textContent = status || 'idle';
+      document.getElementById('hero_badge').textContent = status === 'processing' ? 'Pipeline Running' : status === 'success' ? 'Last Job Success' : status === 'failed' ? 'Last Job Failed' : 'Idle';
+    }}
+
+    function clearCookies() {{
+      document.getElementById('cookies_text').value = '';
+    }}
+
+    function renderJobs(jobs) {{
+      const container = document.getElementById('jobs');
+      container.innerHTML = '';
+      if (!jobs.length) {{
+        container.innerHTML = '<div class="empty">Belum ada job.</div>';
+        return;
+      }}
+      for (const job of jobs) {{
+        const item = document.createElement('div');
+        item.className = `job-item${{currentJobId === job.job_id ? ' active' : ''}}`;
+        item.onclick = () => selectJob(job.job_id);
+        item.innerHTML = `
+          <div class="job-top">
+            <div class="job-id">${{escapeHtml(job.job_id)}}</div>
+            <div class="status ${{job.status}}">${{escapeHtml(job.status)}}</div>
+          </div>
+          <div class="job-title">${{escapeHtml(job.title || '(tanpa title override)')}}</div>
+          <div class="muted">${{escapeHtml(job.episode || 'Episode akan muncul setelah parsing')}}${{job.error ? ' | ' + escapeHtml(job.error) : ''}}</div>
+        `;
+        container.appendChild(item);
+      }}
+    }}
+
+    function updateStats(jobs) {{
+      const total = jobs.length;
+      const processing = jobs.filter(job => job.status === 'processing').length;
+      const success = jobs.filter(job => job.status === 'success').length;
+      document.getElementById('stat_total').textContent = total;
+      document.getElementById('stat_processing').textContent = processing;
+      document.getElementById('stat_success').textContent = success;
+      setFormState(processing > 0, processing > 0 ? 'Masih ada job aktif. Start baru dikunci supaya tidak spam.' : 'Siap menerima job baru.');
+    }}
+
     async function refreshJobs() {{
       const res = await fetch('/videos');
       const jobs = await res.json();
-      const ul = document.getElementById('jobs');
-      ul.innerHTML = '';
-      for (const job of jobs) {{
-        const li = document.createElement('li');
-        li.textContent = `${{job.job_id}} | ${{job.status}} | ${{job.title || ''}}`;
-        li.onclick = () => selectJob(job.job_id);
-        ul.appendChild(li);
+      renderJobs(jobs);
+      updateStats(jobs);
+      if (!currentJobId && jobs.length) {{
+        selectJob(jobs[0].job_id);
       }}
+      return jobs;
     }}
+
     async function startJob() {{
+      setFormState(true, 'Membuat job baru...');
       const payload = {{
         source_url: document.getElementById('source_url').value,
         title: document.getElementById('title').value || null,
@@ -532,31 +980,55 @@ def index() -> str:
       }});
       const data = await res.json();
       if (!res.ok) {{
+        setFormState(false, data.detail || JSON.stringify(data, null, 2));
         alert(JSON.stringify(data, null, 2));
+        await refreshJobs();
         return;
       }}
+      document.getElementById('logs').textContent = 'Job dibuat. Menunggu log pertama...';
+      document.getElementById('details').textContent = JSON.stringify(data, null, 2);
       await refreshJobs();
-      selectJob(data.job_id);
+      await selectJob(data.job_id);
     }}
+
     async function selectJob(jobId) {{
       currentJobId = jobId;
       document.getElementById('job_title').textContent = jobId;
+      document.getElementById('job_subtitle').textContent = 'Streaming log aktif untuk job ini.';
       document.getElementById('logs').textContent = '';
       if (eventSource) eventSource.close();
+      if (detailRefreshHandle) clearTimeout(detailRefreshHandle);
       eventSource = new EventSource(`/videos/${{jobId}}/logs/stream`);
       eventSource.onmessage = (event) => {{
-        document.getElementById('logs').textContent += event.data + "\\n";
+        const box = document.getElementById('logs');
+        const shouldStick = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
+        box.textContent += event.data + "\\n";
+        if (shouldStick) box.scrollTop = box.scrollHeight;
+      }};
+      eventSource.onerror = () => {{
+        const box = document.getElementById('logs');
+        box.textContent += '\\n[stream disconnected, retrying automatically]\\n';
       }};
       await refreshJobDetails();
+      await refreshJobs();
     }}
+
     async function refreshJobDetails() {{
       if (!currentJobId) return;
       const res = await fetch(`/videos/${{currentJobId}}`);
       const data = await res.json();
       document.getElementById('details').textContent = JSON.stringify(data, null, 2);
-      if (data.status === 'processing') setTimeout(refreshJobDetails, 2000);
-      refreshJobs();
+      document.getElementById('job_title').textContent = data.title || currentJobId;
+      document.getElementById('job_subtitle').textContent = `${{data.episode || 'Episode belum final'}} | ${{data.variants.length}} variant`;
+      setCurrentStatus(data.status || 'idle');
+      if (data.status === 'processing') {{
+        detailRefreshHandle = setTimeout(refreshJobDetails, 2000);
+      }} else {{
+        detailRefreshHandle = null;
+      }}
+      await refreshJobs();
     }}
+
     refreshJobs();
   </script>
 </body>
@@ -591,39 +1063,17 @@ async def stream_job_logs(job_id: str) -> StreamingResponse:
 
 @app.post("/videos/process", response_model=VideoJobResponse)
 def process_video(payload: ProcessVideoRequest) -> VideoJobResponse:
-    job_id = str(uuid.uuid4())
-    workspace = WORKDIR_ROOT / job_id
-    workspace.mkdir(parents=True, exist_ok=True)
-    create_job(job_id)
-    single_episode: str | None = None
+    with PROCESS_LOCK:
+        if has_processing_job():
+            raise HTTPException(status_code=409, detail="Masih ada job yang sedang diproses. Tunggu sampai selesai.")
 
-    try:
-        log_info("pipeline started", job_id=job_id, source_url=payload.source_url, title=payload.title or "")
-        files = download_videos(payload.source_url, workspace, payload.cookies_text)
-        update_job(job_id, "processing", title=payload.title or "", episode="")
-
-        for index, file_path in enumerate(files):
-            episode = resolve_episode(file_path)
-            log_info("episode processing", job_id=job_id, file=file_path.name, episode=episode)
-            if len(files) == 1 and index == 0:
-                single_episode = episode
-            variants = transcode_and_store(job_id, file_path, payload.title, episode, workspace)
-            for variant in variants:
-                save_variant(job_id, variant.get("title"), variant["episode"], variant["resolution"], variant["link"])
-            file_path.unlink(missing_ok=True)
-            log_info("source file removed", job_id=job_id, file=file_path.name)
-
-        update_job(job_id, "success", title=payload.title or "", episode=single_episode or "", error="")
-        log_info("pipeline finished", job_id=job_id, status="success")
-    except Exception as exc:
-        delete_variants(job_id)
-        update_job(job_id, "failed", error=str(exc))
-        LOGGER.exception("pipeline failed | job_id=%s", job_id)
-        raise
-    finally:
-        shutil.rmtree(workspace, ignore_errors=True)
-        log_info("workspace removed", job_id=job_id, workspace=str(workspace))
-
+        job_id = str(uuid.uuid4())
+        workspace = WORKDIR_ROOT / job_id
+        workspace.mkdir(parents=True, exist_ok=True)
+        create_job(job_id)
+        log_info("job accepted", job_id=job_id, source_url=payload.source_url)
+        worker = threading.Thread(target=run_pipeline_job, args=(job_id, payload, workspace), daemon=True, name=f"pipeline-{job_id[:8]}")
+        worker.start()
     return build_job_response(job_id)
 
 
