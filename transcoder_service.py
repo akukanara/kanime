@@ -11,22 +11,22 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
+import boto3
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
+from botocore.exceptions import BotoCoreError, ClientError
 
 
 APP_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = APP_DIR / "transcoder_videos.db"
 WORKDIR_ROOT = APP_DIR / "transcoder_workdir"
-CATBOX_UPLOAD_URL = "https://catbox.moe/user/api.php"
-CATBOX_ORIGIN = "https://catbox.moe"
-CATBOX_REFERER = "https://catbox.moe/"
-DEFAULT_BROWSER_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-CATBOX_USERHASH = os.getenv("CATBOX_USERHASH", "").strip()
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "").strip()
+S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID", "").strip()
+S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", "").strip()
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "").strip()
+S3_REGION_NAME = os.getenv("S3_REGION_NAME", "").strip() or None
+S3_PUBLIC_BASE_URL = os.getenv("S3_PUBLIC_BASE_URL", "").strip()
 TARGET_RESOLUTIONS = {"480p": 480, "720p": 720, "1080p": 1080}
 TARGET_AUDIO_BITRATES_KBPS = {"480p": 64, "720p": 96, "1080p": 128}
 TARGET_SIZE_LIMITS_BYTES = {"480p": 100 * 1024 * 1024, "720p": 150 * 1024 * 1024, "1080p": 199 * 1024 * 1024}
@@ -35,10 +35,11 @@ MIN_VIDEO_BITRATE_KBPS = 150
 NVENC_PRESET = os.getenv("NVENC_PRESET", "p1")
 NVENC_CQ = os.getenv("NVENC_CQ", "25")
 CUDA_SCALE_FILTER = os.getenv("CUDA_SCALE_FILTER", "scale_cuda")
-CATBOX_UPLOAD_MAX_ATTEMPTS = 3
-CATBOX_UPLOAD_RETRY_DELAY_SECONDS = 3
+STORAGE_UPLOAD_MAX_ATTEMPTS = 3
+STORAGE_UPLOAD_RETRY_DELAY_SECONDS = 3
 DEV_MODE = False
 LOGGER = logging.getLogger("transcoder_service")
+S3_CLIENT = None
 
 
 class VideoVariantResponse(BaseModel):
@@ -97,9 +98,11 @@ def init_db() -> None:
 
 
 def ensure_system_dependencies() -> None:
-    missing = [command for command in ["ffmpeg", "ffprobe", "curl"] if shutil.which(command) is None]
+    missing = [command for command in ["ffmpeg", "ffprobe"] if shutil.which(command) is None]
     if missing:
         raise RuntimeError(f"Missing required system dependencies: {', '.join(missing)}")
+    if not all([S3_ENDPOINT_URL, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
+        raise RuntimeError("Missing S3/MinIO configuration. Set S3_ENDPOINT_URL, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, and S3_BUCKET_NAME.")
     encoder_list = run_command_with_output(["ffmpeg", "-hide_banner", "-encoders"], cwd=APP_DIR)
     if "hevc_nvenc" not in encoder_list:
         raise RuntimeError("ffmpeg does not expose hevc_nvenc")
@@ -112,8 +115,17 @@ def ensure_system_dependencies() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
+    global S3_CLIENT
     ensure_system_dependencies()
     init_db()
+    S3_CLIENT = boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT_URL,
+        aws_access_key_id=S3_ACCESS_KEY_ID,
+        aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+        region_name=S3_REGION_NAME,
+    )
+    log_info("storage ready", endpoint=S3_ENDPOINT_URL, bucket=S3_BUCKET_NAME, public_base_url=S3_PUBLIC_BASE_URL or S3_ENDPOINT_URL)
     yield
 
 
@@ -247,49 +259,34 @@ def save_variant(job_id: str, title: str | None, episode: str, resolution: str, 
     return {"_id": record_id, "job_id": job_id, "title": title, "episode": episode, "resolution": resolution, "link": link}
 
 
-def upload_to_catbox(file_path: Path, workspace: Path) -> str:
-    log_info("catbox upload started", file=file_path.name, size_bytes=str(file_path.stat().st_size))
-    last_error: HTTPException | None = None
-    for attempt in range(1, CATBOX_UPLOAD_MAX_ATTEMPTS + 1):
-        log_info("catbox upload attempt", file=file_path.name, attempt=str(attempt), max_attempts=str(CATBOX_UPLOAD_MAX_ATTEMPTS))
-        command = [
-            "curl",
-            "--location",
-            "--show-error",
-            "--fail-with-body",
-            "--user-agent",
-            DEFAULT_BROWSER_USER_AGENT,
-            "--header",
-            "Accept: text/plain, */*;q=0.8",
-            "--header",
-            "Accept-Language: en-US,en;q=0.9",
-            "--header",
-            f"Origin: {CATBOX_ORIGIN}",
-            "--header",
-            f"Referer: {CATBOX_REFERER}",
-            "--form",
-            "reqtype=fileupload",
-            "--form",
-            f"fileToUpload=@{file_path.name}",
-            CATBOX_UPLOAD_URL,
-        ]
-        if CATBOX_USERHASH:
-            command[16:16] = ["--form", f"userhash={CATBOX_USERHASH}"]
-        if not DEV_MODE:
-            command.insert(1, "--silent")
+def build_storage_link(object_key: str) -> str:
+    base = S3_PUBLIC_BASE_URL or S3_ENDPOINT_URL
+    return f"{base.rstrip('/')}/{S3_BUCKET_NAME}/{object_key}"
+
+
+def upload_to_storage(file_path: Path, job_id: str, episode: str, resolution: str) -> str:
+    log_info("storage upload started", file=file_path.name, size_bytes=str(file_path.stat().st_size), job_id=job_id, resolution=resolution)
+    assert S3_CLIENT is not None
+    object_key = f"{job_id}/{episode}/{resolution}/{file_path.name}"
+    last_error: Exception | None = None
+    for attempt in range(1, STORAGE_UPLOAD_MAX_ATTEMPTS + 1):
+        log_info("storage upload attempt", file=file_path.name, attempt=str(attempt), max_attempts=str(STORAGE_UPLOAD_MAX_ATTEMPTS))
         try:
-            stdout = run_command_with_output(command, cwd=workspace).strip()
-            if stdout.startswith("http"):
-                log_info("catbox upload finished", file=file_path.name, link=stdout, attempt=str(attempt))
-                return stdout
-            raise HTTPException(status_code=502, detail={"message": "Catbox upload failed", "response": stdout[:1000]})
-        except HTTPException as exc:
-            last_error = exc if exc.status_code == 502 else HTTPException(status_code=502, detail=exc.detail)
-            log_info("catbox upload attempt failed", file=file_path.name, attempt=str(attempt), detail=str(exc.detail))
-            if attempt < CATBOX_UPLOAD_MAX_ATTEMPTS:
-                time.sleep(CATBOX_UPLOAD_RETRY_DELAY_SECONDS)
-    assert last_error is not None
-    raise last_error
+            S3_CLIENT.upload_file(
+                str(file_path),
+                S3_BUCKET_NAME,
+                object_key,
+                ExtraArgs={"ContentType": "video/mp4"},
+            )
+            link = build_storage_link(object_key)
+            log_info("storage upload finished", file=file_path.name, link=link, attempt=str(attempt))
+            return link
+        except (BotoCoreError, ClientError) as exc:
+            last_error = exc
+            log_info("storage upload attempt failed", file=file_path.name, attempt=str(attempt), detail=str(exc))
+            if attempt < STORAGE_UPLOAD_MAX_ATTEMPTS:
+                time.sleep(STORAGE_UPLOAD_RETRY_DELAY_SECONDS)
+    raise HTTPException(status_code=502, detail={"message": "Storage upload failed", "error": str(last_error) if last_error else "unknown"})
 
 
 @app.get("/health")
@@ -327,7 +324,7 @@ async def transcode_upload(
                 continue
             compressed = compress_video(source_path, resolution, height, workspace)
             try:
-                link = upload_to_catbox(compressed, workspace)
+                link = upload_to_storage(compressed, job_id, episode, resolution)
                 variants.append(VideoVariantResponse(**save_variant(job_id, title or None, episode, resolution, link)))
             finally:
                 compressed.unlink(missing_ok=True)
