@@ -98,6 +98,33 @@ def init_db() -> None:
             )
             """
         )
+        columns = [row["name"] for row in connection.execute("PRAGMA table_info(video_uploads)").fetchall()]
+        expected_columns = ["id", "job_id", "title", "episode", "resolution", "link"]
+        if columns != expected_columns:
+            log_info("migrating video_uploads schema", old_columns=",".join(columns))
+            connection.execute("ALTER TABLE video_uploads RENAME TO video_uploads_legacy")
+            connection.execute(
+                """
+                CREATE TABLE video_uploads (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    episode TEXT NOT NULL DEFAULT '',
+                    resolution TEXT NOT NULL,
+                    link TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            legacy_columns = set(columns)
+            if {"id", "job_id", "title", "episode", "resolution", "link"}.issubset(legacy_columns):
+                connection.execute(
+                    """
+                    INSERT INTO video_uploads (id, job_id, title, episode, resolution, link)
+                    SELECT id, job_id, title, episode, resolution, link
+                    FROM video_uploads_legacy
+                    """
+                )
+            connection.execute("DROP TABLE video_uploads_legacy")
         connection.commit()
 
 

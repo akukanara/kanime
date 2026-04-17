@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Local env / editor
+.env
+.env.*
+.idea/
+.vscode/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Service work directories
+workdir/
+transcoder_workdir/
+
+# Logs / temp
+*.log
+tmp/
+temp/
+
+# Video and media artifacts
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.m4v
+*.avi
+*.flv
+*.ts
+*.mp3
+*.m4a
+*.aac
