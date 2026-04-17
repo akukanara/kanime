@@ -64,7 +64,7 @@ Env opsional:
 
 ```bash
 export CATBOX_USERHASH="userhash_akun_catbox_anda"
-export NVENC_PRESET="p4"
+export NVENC_PRESET="p1"
 export NVENC_CQ="25"
 ```
 
@@ -94,6 +94,7 @@ Target ukuran:
 Encoder default:
 
 - `hevc_nvenc`
+- decode CUDA + scaling GPU (`scale_cuda`/`scale_npp`) untuk prioritas speed
 
 Upload ke Catbox akan di-retry sampai 3 kali sebelum request dianggap gagal.
 

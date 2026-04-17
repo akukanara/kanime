@@ -32,8 +32,9 @@ TARGET_AUDIO_BITRATES_KBPS = {"480p": 64, "720p": 96, "1080p": 128}
 TARGET_SIZE_LIMITS_BYTES = {"480p": 100 * 1024 * 1024, "720p": 150 * 1024 * 1024, "1080p": 199 * 1024 * 1024}
 TARGET_VIDEO_BITRATE_CAPS_KBPS = {"480p": 700, "720p": 1600, "1080p": 2800}
 MIN_VIDEO_BITRATE_KBPS = 150
-NVENC_PRESET = os.getenv("NVENC_PRESET", "p4")
+NVENC_PRESET = os.getenv("NVENC_PRESET", "p1")
 NVENC_CQ = os.getenv("NVENC_CQ", "25")
+CUDA_SCALE_FILTER = os.getenv("CUDA_SCALE_FILTER", "scale_cuda")
 CATBOX_UPLOAD_MAX_ATTEMPTS = 3
 CATBOX_UPLOAD_RETRY_DELAY_SECONDS = 3
 DEV_MODE = False
@@ -99,6 +100,14 @@ def ensure_system_dependencies() -> None:
     missing = [command for command in ["ffmpeg", "ffprobe", "curl"] if shutil.which(command) is None]
     if missing:
         raise RuntimeError(f"Missing required system dependencies: {', '.join(missing)}")
+    encoder_list = run_command_with_output(["ffmpeg", "-hide_banner", "-encoders"], cwd=APP_DIR)
+    if "hevc_nvenc" not in encoder_list:
+        raise RuntimeError("ffmpeg does not expose hevc_nvenc")
+    filter_list = run_command_with_output(["ffmpeg", "-hide_banner", "-filters"], cwd=APP_DIR)
+    if "scale_cuda" not in filter_list and "scale_npp" not in filter_list:
+        raise RuntimeError("ffmpeg does not expose scale_cuda or scale_npp")
+    active_filter = "scale_cuda" if "scale_cuda" in filter_list else "scale_npp"
+    log_info("nvidia path ready", encoder="hevc_nvenc", scale_filter=active_filter, preset=NVENC_PRESET, cq=NVENC_CQ)
 
 
 @asynccontextmanager
@@ -168,19 +177,24 @@ def calculate_video_bitrate_kbps(duration_seconds: float, resolution: str) -> in
 
 
 def build_ffmpeg_command(input_path: Path, output_path: Path, height: int, video_bitrate_kbps: int, audio_bitrate_kbps: int) -> list[str]:
+    scale_filter = "scale_cuda" if CUDA_SCALE_FILTER == "scale_cuda" else "scale_npp"
     return [
         "ffmpeg",
         "-y",
         "-hwaccel",
         "cuda",
+        "-hwaccel_output_format",
+        "cuda",
         "-i",
         str(input_path),
         "-vf",
-        f"scale=-2:{height}",
+        f"{scale_filter}=-2:{height}",
         "-c:v",
         "hevc_nvenc",
         "-preset",
         NVENC_PRESET,
+        "-tune",
+        "hq",
         "-cq",
         NVENC_CQ,
         "-b:v",
